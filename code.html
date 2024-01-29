@@ -1,92 +1,115 @@
 package io.opentracing.contrib.okhttp3;
 
 import io.opentracing.Span;
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.Map;
+import io.opentracing.contrib.concurrent.TracedExecutorService;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.logging.Logger;
 
+import io.opentracing.Tracer;
 import io.opentracing.tag.Tags;
-import okhttp3.Connection;
+import okhttp3.Dispatcher;
+import okhttp3.Interceptor;
+import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 
 /**
- * Span decorator to add tags, logs and operation name.
+ * OkHttp interceptor to trace client requests. Interceptor adds span context into outgoing requests.
+ * Please only use this instrumentation when {@link TracingCallFactory} is not possible to use. This
+ * instrumentation fails to properly infer parent span when doing simultaneously asynchronous calls.
  *
+ * <p>Initialization via {@link TracingInterceptor#addTracing(OkHttpClient.Builder, Tracer, List)}
+ *
+ * <p>or instantiate the interceptor and add it to {@link OkHttpClient.Builder#addInterceptor(Interceptor)} and
+ * {@link OkHttpClient.Builder#addNetworkInterceptor(Interceptor)}.
  * @author Pavol Loffay
  */
-public interface OkHttpClientSpanDecorator {
+public class TracingInterceptor implements Interceptor {
+    private static final Logger log = Logger.getLogger(TracingInterceptor.class.getName());
+
+    private Tracer tracer;
+    private List<OkHttpClientSpanDecorator> decorators;
+
 
     /**
-     * Decorate span before a request is made.
+     * Create tracing interceptor. Interceptor has to be added to {@link OkHttpClient.Builder#addInterceptor(Interceptor)}
+     * and {@link OkHttpClient.Builder#addNetworkInterceptor(Interceptor)}.
      *
-     * @param request request
-     * @param span span
+     * @param tracer tracer
      */
-    void onRequest(Request request, Span span);
+    public TracingInterceptor(Tracer tracer) {
+        this(tracer, Collections.singletonList(OkHttpClientSpanDecorator.STANDARD_TAGS));
+    }
 
     /**
-     * Decorate span on an error e.g. {@link java.net.UnknownHostException} or any exception in interceptor.
+     * Create tracing interceptor. Interceptor has to be added to {@link OkHttpClient.Builder#addInterceptor(Interceptor)}
+     * and {@link OkHttpClient.Builder#addNetworkInterceptor(Interceptor)}.
      *
-     * @param throwable exception
-     * @param span span
+     * @param tracer tracer
+     * @param decorators decorators
      */
-    void onError(Throwable throwable, Span span);
+    public TracingInterceptor(Tracer tracer, List<OkHttpClientSpanDecorator> decorators) {
+        this.tracer = tracer;
+        this.decorators = new ArrayList<>(decorators);
+    }
 
-    /**
-     * This is invoked after {@link okhttp3.Interceptor.Chain#proceed(Request)} in network interceptor.
-     * In this method it is possible to capture server address, log redirects etc.
-     *
-     * @param connection connection
-     * @param response response
-     * @param span span
-     */
-    void onResponse(Connection connection, Response response, Span span);
+    public static OkHttpClient addTracing(OkHttpClient.Builder builder, Tracer tracer) {
+        return TracingInterceptor.addTracing(builder, tracer,
+                Collections.singletonList(OkHttpClientSpanDecorator.STANDARD_TAGS));
+    }
 
-    /**
-     * Decorator which adds standard HTTP and peer tags to the span.
-     *
-     * <p> On error it adds {@link Tags#ERROR} with log representing exception and
-     * on redirects adds log entries with peer tags.
-     *
-     */
-    OkHttpClientSpanDecorator STANDARD_TAGS = new OkHttpClientSpanDecorator() {
-        @Override
-        public void onRequest(Request request, Span span) {
-            Tags.COMPONENT.set(span, TracingCallFactory.COMPONENT_NAME);
-            Tags.HTTP_METHOD.set(span, request.method());
-            Tags.HTTP_URL.set(span, request.url().toString());
-        }
+    public static OkHttpClient addTracing(OkHttpClient.Builder builder,
+                                          Tracer tracer, List<OkHttpClientSpanDecorator> decorators) {
+        TracingInterceptor tracingInterceptor = new TracingInterceptor(tracer, decorators);
+        builder.interceptors().add(0, tracingInterceptor);
+        builder.networkInterceptors().add(0, tracingInterceptor);
+        builder.dispatcher(new Dispatcher(new TracedExecutorService(Executors.newFixedThreadPool(10), tracer)));
+        return builder.build();
+    }
 
-        @Override
-        public void onError(Throwable throwable, Span span) {
-            Tags.ERROR.set(span, Boolean.TRUE);
-            span.log(errorLogs(throwable));
-        }
+    @Override
+    public Response intercept(Chain chain) throws IOException {
+        Response response = null;
 
-        @Override
-        public void onResponse(Connection connection, Response response, Span span) {
-            Tags.HTTP_STATUS.set(span, response.code());
-            InetAddress inetAddress = connection.socket().getInetAddress();
-            Tags.PEER_HOSTNAME.set(span, inetAddress.getHostName());
-            Tags.PEER_PORT.set(span, connection.socket().getPort());
+        // application interceptor?
+        if (chain.connection() == null) {
+            Span span = tracer.buildSpan(chain.request().method())
+                    .withTag(Tags.COMPONENT.getKey(), TracingCallFactory.COMPONENT_NAME)
+                    .start();
 
-            if (inetAddress instanceof Inet4Address) {
-                byte[] address = inetAddress.getAddress();
-                Tags.PEER_HOST_IPV4.set(span, ByteBuffer.wrap(address).getInt());
+            Request.Builder requestBuilder = chain.request().newBuilder();
+
+            Object tag = chain.request().tag();
+            TagWrapper tagWrapper = tag instanceof TagWrapper
+                    ? (TagWrapper) tag : new TagWrapper(tag);
+            requestBuilder.tag(new TagWrapper(tagWrapper, span));
+
+            try {
+                response = chain.proceed(requestBuilder.build());
+            } catch (Throwable ex) {
+                for (OkHttpClientSpanDecorator spanDecorator: decorators) {
+                    spanDecorator.onError(ex, span);
+                }
+                throw ex;
+            } finally {
+                span.finish();
+            }
+        } else {
+            Object tag = chain.request().tag();
+            if (tag instanceof TagWrapper) {
+                TagWrapper tagWrapper = (TagWrapper) tag;
+                response = new TracingCallFactory.NetworkInterceptor(tracer, tagWrapper.getSpan().context(), decorators)
+                        .intercept(chain);
             } else {
-                Tags.PEER_HOST_IPV6.set(span, inetAddress.toString());
+                log.severe("tag is null or not an instance of TagWrapper, skipping decorator onResponse()");
             }
         }
 
-        protected Map<String, Object> errorLogs(Throwable throwable) {
-            Map<String, Object> errorLogs = new HashMap<>(2);
-            errorLogs.put("event", Tags.ERROR.getKey());
-            errorLogs.put("error.object", throwable);
+        return response;
+    }
 
-            return errorLogs;
-        }
-    };
 }
